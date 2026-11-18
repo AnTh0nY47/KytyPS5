@@ -17,6 +17,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -177,6 +178,25 @@ private:
 	std::jthread m_thread;
 };
 
+// Runs shader and pipeline compilation in the background. Stop drops the queued jobs and waits
+// for the running ones, so every job has either finished or never started once it returns.
+class ShaderCompileWorkers {
+public:
+	ShaderCompileWorkers() = default;
+	~ShaderCompileWorkers() { Stop(); }
+	KYTY_CLASS_NO_COPY(ShaderCompileWorkers);
+	void Start(size_t count);
+	void Post(Common::UniqueFunction<void>&& job);
+	void Stop();
+	explicit operator bool() const { return !m_threads.empty(); }
+
+private:
+	std::mutex                               m_mutex;
+	std::condition_variable_any              m_ready;
+	std::queue<Common::UniqueFunction<void>> m_jobs;
+	std::vector<std::jthread>                m_threads;
+};
+
 // The owning renderer serializes access, including saves while the GPU is running.
 class PipelineCache {
 public:
@@ -199,25 +219,38 @@ public:
 		bool                    uses_image_heap       = false;
 	};
 
-	// Reads the shaders and registers bound in `command` into the state's shader stages.
+	// Reads the shaders and registers bound in `command` into the state's shader stages. A stage
+	// still compiling in the background leaves vertex_info[0].stage.module null, which skips the
+	// draw.
 	void GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state);
 	// Null skips the dispatch.
 	const ShaderModule* GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                      ShaderComputeInputInfo&      input_info);
 
-	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state,
+	// Null while the pipeline is still being created in the background; the draw is skipped.
+	Pipeline* GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state,
 	                              const DrawTargets& targets);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
 
 private:
 	friend struct PipelineCacheTestAccess;
 
+	// Background compilation. A worker fills a job and then sets `done`; only the render thread
+	// reads the results and adds them to the caches, so the caches stay single-threaded.
+	struct ProgramJob;
+	struct ModuleJob;
+	struct PipelineJob;
+
 	struct Program {
 		std::unique_ptr<ShaderRecompiler::ShaderSource> call_source;
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::vector<ShaderModule>                    modules;
+		// A deque keeps the modules in place as more are added, since pipelines being created
+		// in the background point at them.
+		std::deque<ShaderModule>                     modules;
+		// Variants compiling in the background.
+		std::vector<std::shared_ptr<ModuleJob>>      jobs;
 		bool                                         skip_dispatch = false;
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
@@ -262,6 +295,13 @@ private:
 	std::unordered_map<uint64_t, ShaderTessellationInputInfo>                  m_tess_layouts;
 	// Records everything first created if a shader store is open, and writes the driver cache.
 	ShaderStoreWriter m_store;
+	// Programs whose first translation runs in the background, by key.
+	std::unordered_map<ProgramKey, std::shared_ptr<ProgramJob>, ProgramKeyHash> m_program_jobs;
+	std::unordered_map<GraphicsPipelineKey, std::shared_ptr<PipelineJob>, GraphicsPipelineKeyHash>
+	    m_pipeline_jobs;
+	// Whether new graphics shaders and pipelines compile in the background.
+	bool                 m_async = false;
+	ShaderCompileWorkers m_workers;
 
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
@@ -270,6 +310,26 @@ private:
 	                            ShaderRecompiler::CompileOptions  options,
 	                            ShaderRecompiler::TranslateResult translated,
 	                            uint32_t                          push_data_cursor);
+
+	struct BuiltModule {
+		ShaderModule          module;
+		std::vector<uint32_t> spirv;
+	};
+	// Compiles a translated program. Reads only the graphics context, so workers may call it.
+	BuiltModule BuildModule(const ProgramKey& key, ShaderRecompiler::CompileOptions options,
+	                        ShaderRecompiler::TranslateResult                   translated,
+	                        const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                        std::span<const uint32_t>                           function_code,
+	                        uint32_t push_data_cursor) const;
+	// Adds a built module to its program and records it in the shader store.
+	ShaderModule& PublishModule(Program& program, const ProgramKey& key, BuiltModule&& built);
+	// Publishes the program's variants the workers have finished.
+	void PublishFinishedModules(Program& program, const ProgramKey& key);
+	// Queues the variant the program's current specialization selects, unless it is queued.
+	template <typename InputInfo>
+	void QueueModule(Program& program, const ProgramKey& key, const ShaderParams& params,
+	                 const InputInfo& input_info, const ShaderRecompiler::CompileOptions& options,
+	                 uint32_t push_data_cursor, std::shared_ptr<ProgramJob> translation);
 	void InitializeDriverCache();
 	// Marks the driver cache changed and, once per interval, has the store thread write it.
 	void CheckpointDriverCache();

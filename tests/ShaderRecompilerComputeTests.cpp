@@ -1172,6 +1172,8 @@ void EnsureConfigInitialized() {
     subsystems.Initialize<Config::Lifecycle>();
     Config::ConfigOptions options;
     options.printf_direction = Config::LogDirection::Silent;
+    // Tests read the shaders and pipelines they request right away.
+    options.async_shaders_enabled = false;
     Config::Load(options);
     subsystems.Initialize<Log::Lifecycle>();
     subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
@@ -20549,7 +20551,7 @@ public:
       DrawRenderState state{.topology = topology, .ps_active = true,
                             .vertex_info = {vertex}, .ps_input_info = pixel};
       const DrawTargets targets{.depth = depth, .colors = {color}, .color_count = 1};
-      return context.GetPipelineCache().GetGraphicsPipeline(scheduler.Current(), state, targets);
+      return *context.GetPipelineCache().GetGraphicsPipeline(scheduler.Current(), state, targets);
     };
     auto &filled = pipeline(true, 2, 2);
     const auto draw = [&](const PipelineCache::Pipeline &selected,

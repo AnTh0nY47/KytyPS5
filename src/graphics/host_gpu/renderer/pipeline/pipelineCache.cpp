@@ -32,9 +32,12 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <memory>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
+#include <thread>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -232,7 +235,116 @@ std::vector<vk::Format> VertexInputFormats(const ShaderVertexInputInfo&         
 	return formats;
 }
 
+// What a background translation reads, copied so that the draw which queued it can end. The
+// options point into the copies, so the inputs stay where they were made.
+struct StageInputs {
+	template <typename InputInfo>
+	StageInputs(const ShaderParams& params, const InputInfo& input_info,
+	            const ShaderRecompiler::CompileOptions& compile_options)
+	    : code(params.code.begin(), params.code.end()),
+	      back_code(params.back_code.begin(), params.back_code.end()),
+	      user_data(params.user_data.begin(), params.user_data.begin() + params.user_data_count),
+	      options(compile_options) {
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			vertex                   = input_info;
+			options.input_info.vertex = &vertex;
+		} else {
+			static_assert(std::is_same_v<InputInfo, ShaderPixelInputInfo>);
+			pixel                    = input_info;
+			options.input_info.pixel = &pixel;
+		}
+		options.user_data = user_data;
+		options.back_code = back_code;
+	}
+	KYTY_CLASS_NO_COPY(StageInputs);
+
+	ShaderVertexInputInfo            vertex {};
+	ShaderPixelInputInfo             pixel {};
+	std::vector<uint32_t>            code;
+	std::vector<uint32_t>            back_code;
+	std::vector<uint32_t>            user_data;
+	ShaderRecompiler::CompileOptions options;
+};
+
+// Background workers, leaving most hardware threads to the game.
+size_t ShaderCompileThreads() {
+	return std::clamp(std::thread::hardware_concurrency() / 4u, 1u, 4u);
+}
+
 } // namespace
+
+// The first translation of a program, which gives its resource plan.
+struct PipelineCache::ProgramJob {
+	template <typename InputInfo>
+	ProgramJob(const ShaderParams& params, const InputInfo& input_info,
+	           const ShaderRecompiler::CompileOptions& options)
+	    : inputs(params, input_info, options) {}
+
+	StageInputs      inputs;
+	std::atomic_bool done {false};
+	// The program has GPU-selected calls or calls it cannot run, which the render thread handles.
+	bool                                             render_thread = false;
+	ShaderRecompiler::ShaderSource                   source;
+	std::optional<ShaderRecompiler::TranslateResult> translated;
+};
+
+// One variant of a program, selected by its specialization and push data cursor.
+struct PipelineCache::ModuleJob {
+	template <typename InputInfo>
+	ModuleJob(const ProgramKey& program_key, const ShaderParams& params,
+	          const InputInfo& input_info, const ShaderRecompiler::CompileOptions& options,
+	          const ShaderRecompiler::IR::ResourceSpecialization& variant, uint32_t cursor,
+	          std::shared_ptr<ProgramJob> first_translation)
+	    : inputs(params, input_info, options), key(program_key), specialization(variant),
+	      push_data_cursor(cursor), translation(std::move(first_translation)) {}
+
+	StageInputs                                  inputs;
+	ProgramKey                                   key;
+	ShaderRecompiler::IR::ResourceSpecialization specialization;
+	uint32_t                                     push_data_cursor = 0;
+	// The program's first translation, reused when it was made from the same inputs.
+	std::shared_ptr<ProgramJob> translation;
+	std::atomic_bool            done {false};
+	BuiltModule                 built;
+};
+
+struct PipelineCache::PipelineJob {
+	std::atomic_bool done {false};
+	Pipeline         pipeline;
+};
+
+void ShaderCompileWorkers::Start(size_t count) {
+	for (size_t i = 0; i < count; i++) {
+		m_threads.emplace_back([this](std::stop_token stop) {
+			std::unique_lock lock(m_mutex);
+			// Stop empties the queue first, so the wait then returns false.
+			while (m_ready.wait(lock, stop, [this] { return !m_jobs.empty(); })) {
+				auto job = std::move(m_jobs.front());
+				m_jobs.pop();
+				lock.unlock();
+				job();
+				lock.lock();
+			}
+		});
+	}
+}
+
+void ShaderCompileWorkers::Post(Common::UniqueFunction<void>&& job) {
+	{
+		std::scoped_lock lock(m_mutex);
+		m_jobs.push(std::move(job));
+	}
+	m_ready.notify_one();
+}
+
+void ShaderCompileWorkers::Stop() {
+	{
+		std::scoped_lock lock(m_mutex);
+		m_jobs = {};
+	}
+	// Destroying a jthread requests its stop and joins it.
+	m_threads.clear();
+}
 
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	// AMD GPUs (vendor 0x1002) run NMin/NMax as v_min/v_max, which give the guest's NaN and
@@ -304,33 +416,59 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
                                            ShaderRecompiler::CompileOptions  options,
                                            ShaderRecompiler::TranslateResult translated,
                                            uint32_t                          push_data_cursor) {
+	return PublishModule(program, key,
+	                     BuildModule(key, std::move(options), std::move(translated),
+	                                 program.specialization, program.FunctionCode(),
+	                                 push_data_cursor));
+}
+
+PipelineCache::BuiltModule PipelineCache::BuildModule(
+    const ProgramKey& key, ShaderRecompiler::CompileOptions options,
+    ShaderRecompiler::TranslateResult                   translated,
+    const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+    std::span<const uint32_t> function_code, uint32_t push_data_cursor) const {
 	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ShadersCompiled,
 	                                         Common::DebugCounters::Counter::ShaderCompileNs,
 	                                         Common::DebugCounters::Peak::ShaderCompileNs);
 	const auto profile = SpirvProfile(m_graphics);
 	options.profile    = &profile;
-	auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
-	                                               program.specialization, push_data_cursor);
+	auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization,
+	                                               push_data_cursor);
 	auto info = std::move(result.program).TakeCompiledInfo();
 
 	// The same inputs give the same module id across runs.
-	const auto function_code = program.FunctionCode();
 	ShaderRecompiler::IR::Writer inputs;
 	ShaderRecompiler::IR::IoAll(inputs, key.stage, key.hash, key.user_data_count, key.static_state,
-	                            info.bindings.push_data_start_dword, program.specialization);
+	                            info.bindings.push_data_start_dword, specialization);
 	inputs.Raw(function_code.data(), function_code.size_bytes()); // Last, so it needs no size.
 	const auto id = XXH3_64bits(inputs.bytes.data(), inputs.bytes.size());
 
 	const auto* stage = ShaderRecompiler::StageName(key.stage);
 	DumpShader(result.spirv, fmt::format("{}_{:016x}_{:016x}.spv", stage, key.hash, id));
 	ValidateShaderSpirv(stage, key.hash, result.spirv, profile.maintenance8);
-	auto& module = program.modules.emplace_back(ShaderModule {
-	    .id             = id,
-	    .module         = CompileSPV(result.spirv, m_graphics.device),
-	    .info           = std::move(info),
-	    .specialization = program.specialization,
-	    .function_code  = {function_code.begin(), function_code.end()},
-	});
+	BuiltModule built;
+	auto&       module = built.module;
+	module.id             = id;
+	module.module         = CompileSPV(result.spirv, m_graphics.device);
+	module.info           = std::move(info);
+	module.specialization = specialization;
+	module.function_code.assign(function_code.begin(), function_code.end());
+	// The inputs of these come from the stage's static key.
+	if (key.stage == ShaderType::Vertex || key.stage == ShaderType::Local) {
+		module.vertex_formats = VertexInputFormats(*options.input_info.vertex, module.info);
+	} else if (key.stage == ShaderType::Pixel &&
+	           options.input_info.pixel->parameter_mode == ShaderPixelParameterMode::Rectangle) {
+		module.rect_parameters = RectListParameters(*options.input_info.pixel, module.info);
+	} else if (key.stage == ShaderType::Mesh) {
+		module.mesh_task = options.input_info.vertex->indirect_draw;
+	}
+	built.spirv = std::move(result.spirv);
+	return built;
+}
+
+ShaderModule& PipelineCache::PublishModule(Program& program, const ProgramKey& key,
+                                           BuiltModule&& built) {
+	auto& module = program.modules.emplace_back(std::move(built.module));
 	m_compiled[static_cast<size_t>(key.stage)]++;
 	// Guest geometry shaders are compiled through the host mesh stage.
 	std::printf("Shaders: VS %u | PS %u | CS %u | GS %u | LS %u | HS %u | TES %u\n",
@@ -341,20 +479,47 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	            m_compiled[static_cast<size_t>(ShaderType::Local)],
 	            m_compiled[static_cast<size_t>(ShaderType::TessellationControl)],
 	            m_compiled[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
-	// The inputs of these come from the stage's static key.
-	if (key.stage == ShaderType::Vertex || key.stage == ShaderType::Local) {
-		module.vertex_formats = VertexInputFormats(*options.input_info.vertex, module.info);
-	} else if (key.stage == ShaderType::Pixel &&
-	           options.input_info.pixel->parameter_mode == ShaderPixelParameterMode::Rectangle) {
-		module.rect_parameters = RectListParameters(*options.input_info.pixel, module.info);
-	} else if (key.stage == ShaderType::Mesh) {
-		module.mesh_task = options.input_info.vertex->indirect_draw;
-	}
 	// Programs with GPU-selected calls depend on their callees' current code.
 	if (program.call_source == nullptr) {
-		StoreModule(key, program, module, result.spirv);
+		StoreModule(key, program, module, built.spirv);
 	}
 	return module;
+}
+
+void PipelineCache::PublishFinishedModules(Program& program, const ProgramKey& key) {
+	std::erase_if(program.jobs, [&](const std::shared_ptr<ModuleJob>& job) {
+		if (!job->done.load(std::memory_order_acquire)) {
+			return false;
+		}
+		PublishModule(program, key, std::move(job->built));
+		return true;
+	});
+}
+
+template <typename InputInfo>
+void PipelineCache::QueueModule(Program& program, const ProgramKey& key, const ShaderParams& params,
+                                const InputInfo&                        input_info,
+                                const ShaderRecompiler::CompileOptions& options,
+                                uint32_t push_data_cursor, std::shared_ptr<ProgramJob> translation) {
+	for (const auto& queued: program.jobs) {
+		if (queued->push_data_cursor == push_data_cursor &&
+		    queued->specialization == program.specialization) {
+			return;
+		}
+	}
+	auto job = std::make_shared<ModuleJob>(key, params, input_info, options, program.specialization,
+	                                       push_data_cursor, std::move(translation));
+	program.jobs.push_back(job);
+	m_workers.Post([this, job] {
+		auto& inputs     = job->inputs;
+		auto  translated = job->translation != nullptr
+		                       ? std::move(*job->translation->translated)
+		                       : ShaderRecompiler::TranslateProgram(
+		                             std::span<const uint32_t>(inputs.code), inputs.options);
+		job->built = BuildModule(job->key, inputs.options, std::move(translated),
+		                         job->specialization, {}, job->push_data_cursor);
+		job->done.store(true, std::memory_order_release);
+	});
 }
 
 template <typename InputInfo>
@@ -408,6 +573,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			source_changed = cached.RefreshCallSource(runtime);
 			if (!source_changed) module = cached.FindModule<true>(runtime, push_data_cursor);
 		} else {
+			if (!cached.jobs.empty()) PublishFinishedModules(cached, entry->first);
 			module = cached.FindModule<false>(runtime, push_data_cursor);
 		}
 		if (module != nullptr) return bind(*module);
@@ -418,6 +584,53 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	options.back_code       = params.back_code;
 	options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 	options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
+	// Draws wait for new graphics programs in the background. Dispatches are never skipped,
+	// since that would change what the game computes, and programs with GPU-selected calls
+	// follow their callees on the render thread.
+	if constexpr (!std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+		if (m_async && entry != m_program_cache.end() && entry->second.call_source == nullptr) {
+			QueueModule(entry->second, entry->first, params, input_info, options, push_data_cursor,
+			            nullptr);
+			return nullptr;
+		}
+		if (m_async && entry == m_program_cache.end()) {
+			const auto [job_entry, queued] = m_program_jobs.try_emplace(m_lookup_key);
+			if (queued) {
+				auto job          = std::make_shared<ProgramJob>(params, input_info, options);
+				job_entry->second = job;
+				m_workers.Post([job] {
+					const auto& inputs = job->inputs;
+					job->source = ShaderRecompiler::PrepareShaderSource(inputs.code, inputs.options);
+					if (job->source.unsupported_call_pc != UINT32_MAX || !job->source.calls.empty()) {
+						job->render_thread = true;
+					} else {
+						job->translated =
+						    ShaderRecompiler::TranslateProgram(job->source.decoded, inputs.options);
+					}
+					job->done.store(true, std::memory_order_release);
+				});
+				return nullptr;
+			}
+			auto job = job_entry->second;
+			if (!job->done.load(std::memory_order_acquire)) {
+				return nullptr;
+			}
+			m_program_jobs.erase(job_entry);
+			if (!job->render_thread) {
+				entry = m_program_cache.emplace(m_lookup_key, Program {
+				    .resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(job->translated->program),
+				}).first;
+				auto& program = entry->second;
+				EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
+				    program.resource_plan, runtime, program.resources, program.specialization));
+				// The translation depends on the user data, so another draw's is not reused.
+				const bool same_inputs = std::ranges::equal(job->inputs.user_data, user_data);
+				QueueModule(program, entry->first, params, input_info, options, push_data_cursor,
+				            same_inputs ? std::move(job) : nullptr);
+				return nullptr;
+			}
+		}
+	}
 	ShaderRecompiler::ShaderSource source;
 	if (entry == m_program_cache.end()) {
 		DumpShader(params.code, fmt::format("original/{}_{:016x}.bin",
@@ -473,22 +686,46 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 	WarmUp(shader_store);
+	// Debug dumps follow the order shaders are compiled in.
+	m_async = Config::AsyncShadersEnabled() && !Config::GraphicsDebugDumpEnabled();
+	if (m_async) {
+		const auto threads = ShaderCompileThreads();
+		m_workers.Start(threads);
+		PipelineCacheLog("Shaders: compiling new shaders and pipelines in the background with {} "
+		                 "threads (--sync-shaders turns this off)",
+		                 threads);
+	}
 }
 
 PipelineCache::~PipelineCache() {
+	// Every job has finished or never started past this point.
+	m_workers.Stop();
 	Save();
-	auto destroy = [this](const auto& pipelines) {
+	auto destroy_pipeline = [this](const Pipeline& pipeline) {
+		m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+		m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
+		m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
+	};
+	auto destroy = [&](const auto& pipelines) {
 		for (const auto& pipeline: pipelines | std::views::values) {
-			m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
-			m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
-			m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
+			destroy_pipeline(pipeline);
 		}
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	for (const auto& job: m_pipeline_jobs | std::views::values) {
+		if (job->done.load(std::memory_order_acquire)) {
+			destroy_pipeline(job->pipeline);
+		}
+	}
 	for (const auto& program: m_program_cache | std::views::values) {
 		for (const auto& module: program.modules) {
 			m_graphics.device.destroyShaderModule(module.module, nullptr);
+		}
+		for (const auto& job: program.jobs) {
+			if (job->done.load(std::memory_order_acquire)) {
+				m_graphics.device.destroyShaderModule(job->built.module.module, nullptr);
+			}
 		}
 	}
 	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
@@ -865,7 +1102,13 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
 	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
 	if (pixel_active) {
-		const auto& pixel_module = *GetProgram(pixel_params, pixel_info, push_data_cursor);
+		const auto* pixel_program = GetProgram(pixel_params, pixel_info, push_data_cursor);
+		// While the pixel program compiles, the vertex stages wait for its push data layout and
+		// the draw is skipped.
+		if (pixel_program == nullptr) {
+			return;
+		}
+		const auto& pixel_module = *pixel_program;
 		for (const auto& output: pixel_module.info.info.outputs) {
 			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt ||
 			    output.kind == ShaderRecompiler::IR::StageOutputKind::ObjectPrimitiveId) {
@@ -875,7 +1118,11 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		state.mrt_mask &= color_output_mask;
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
-		GetProgram(vertex_params[i], vertex_info[i], push_data_cursor);
+		// A stage still compiling skips the draw; the later stages wait for its push data layout.
+		if (GetProgram(vertex_params[i], vertex_info[i], push_data_cursor) == nullptr) {
+			vertex_info[0].stage.module = nullptr;
+			return;
+		}
 	}
 }
 
@@ -889,7 +1136,7 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 	return GetProgram(params, input_info, push_data_cursor);
 }
 
-PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
+PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
                                                             const DrawRenderState& state,
                                                             const DrawTargets&     targets) {
 	const auto* colors        = targets.colors;
@@ -1058,12 +1305,37 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		}
 	}
 
-	auto [iter, inserted] = m_graphics_pipelines.try_emplace(key);
-	auto& pipeline        = iter->second;
-	if (!inserted) {
-		return pipeline;
+	if (const auto found = m_graphics_pipelines.find(key); found != m_graphics_pipelines.end()) {
+		return &found->second;
 	}
 
+	if (m_async) {
+		const auto [job_entry, queued] = m_pipeline_jobs.try_emplace(key);
+		if (queued) {
+			auto job          = std::make_shared<PipelineJob>();
+			job_entry->second = job;
+			// The stage modules stay in place while the program caches grow.
+			m_workers.Post([this, job, key, stages] {
+				Common::DebugCounters::ScopedTimer timer(
+				    Common::DebugCounters::Counter::PipelinesCreated,
+				    Common::DebugCounters::Counter::PipelineCreateNs,
+				    Common::DebugCounters::Peak::PipelineCreateNs);
+				CreatePipelineInternal(m_graphics, job->pipeline, key, stages, m_driver_cache);
+				job->done.store(true, std::memory_order_release);
+			});
+			return nullptr;
+		}
+		if (!job_entry->second->done.load(std::memory_order_acquire)) {
+			return nullptr;
+		}
+		auto& pipeline = m_graphics_pipelines.emplace(key, job_entry->second->pipeline).first->second;
+		m_pipeline_jobs.erase(job_entry);
+		StorePipeline(key);
+		CheckpointDriverCache();
+		return &pipeline;
+	}
+
+	auto& pipeline = m_graphics_pipelines[key];
 	if (graphics_debug_dump_enabled()) {
 		ShaderDbgDumpInputInfo(vs_input_info);
 		if (ps_active) {
@@ -1080,7 +1352,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	StorePipeline(key);
 	CheckpointDriverCache();
 
-	return pipeline;
+	return &pipeline;
 }
 
 PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info) {

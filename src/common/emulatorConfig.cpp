@@ -169,6 +169,10 @@ bool ShaderCacheEnabled() {
 	return g_config->shader_cache_enabled;
 }
 
+bool AsyncShadersEnabled() {
+	return g_config->async_shaders_enabled;
+}
+
 LogDirection GetShaderLogDirection() {
 	return g_config->shader_log_direction;
 }
