@@ -911,10 +911,16 @@ struct Tcb {
 };
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Reserve the TCB TLS slot during static initialization, before main() and before Vulkan
+// layers, the GPU driver or overlays can use up the 64 slots that sit at a fixed TEB offset.
+static const DWORD g_tcb_slot = TlsAlloc();
+
 static DWORD TcbSlot() {
-	static const DWORD slot = TlsAlloc();
-	EXIT_IF(slot >= 64); // later slots are not at a fixed TEB offset
-	return slot;
+	if (g_tcb_slot == TLS_OUT_OF_INDEXES || g_tcb_slot >= 64) {
+		EXIT("TCB TLS slot %u is not in the fixed TEB range (< 64)\n",
+		     static_cast<unsigned>(g_tcb_slot));
+	}
+	return g_tcb_slot;
 }
 
 static uint32_t TcbGsOffset() {
