@@ -598,14 +598,19 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		                           view_base)) {
 			// The layout stores no mip past MAX_MIP here, so a view starting in the chain ends at
 			// MAX_MIP; dynamic-mip shaders still count mips up to LAST_LEVEL.
-			if (base_level >= physical_levels ||
-			    resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
+						if (base_level >= physical_levels) {
+				// The view starts past MAX_MIP, where the layout stores nothing. Sample the last
+				// stored mip instead of aborting; it is the closest data the guest has.
+				view_base   = physical_levels - 1u;
+				view_levels = 1u;
+			} else if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
 				EXIT("unsupported texture mip view changes physical layout: base=%u last=%u "
 				     "max=%u extent=%ux%ux%u tile=%u\n",
 				     base_level, last_level, max_mip, width, height, depth,
 				     static_cast<uint32_t>(tile));
+			} else {
+				view_levels = physical_levels - base_level;
 			}
-			view_levels                = physical_levels - base_level;
 			desc.info.resources.levels = physical_levels;
 			desc.info.data.size        = 0;
 			desc.info.UpdateSize();
