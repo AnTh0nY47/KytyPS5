@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fmt/format.h>
 #include <functional>
 #include <optional>
 #include <random>
@@ -189,6 +190,26 @@ static uint64_t ReadDirectory(File* file, void* buf, uint64_t count) {
 		file->dents_offset += bytes;
 	}
 	return bytes;
+}
+
+// The host read stops without filling the guest buffer when it meets a page another thread made
+// read-only for GPU tracking after InvalidateMemory. Reads the rest into host memory and copies
+// it, since the copy's faults go through the guest memory handlers like any other host write.
+static uint32_t FinishGuestRead(File* file, void* buf, uint64_t start, uint32_t bytes_read,
+                                uint64_t expected) {
+	if (bytes_read >= expected) {
+		return bytes_read;
+	}
+	std::vector<uint8_t> rest(expected - bytes_read);
+	uint32_t             extra = 0;
+	file->f.Seek(start + bytes_read);
+	file->f.Read(rest.data(), static_cast<uint32_t>(rest.size()), &extra);
+	std::memcpy(static_cast<uint8_t*>(buf) + bytes_read, rest.data(), extra);
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "File read: host read stopped at {} of {} bytes, read the rest through host memory ({} "
+	    "bytes): {}\n",
+	    bytes_read, expected, extra, Common::PathToString(file->real_name)));
+	return bytes_read + extra;
 }
 
 static int PosixToKernel(int posix_errno) {
@@ -714,6 +735,7 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	                         std::min<uint64_t>(nbytes, remaining));
 	uint32_t bytes_read = 0;
 	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	bytes_read = FinishGuestRead(file, buf, pos, bytes_read, std::min<uint64_t>(nbytes, remaining));
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes_read);
 
 	file->mutex.Unlock();
@@ -842,6 +864,8 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 	uint32_t bytes_read = 0;
 	file->f.Seek(offset);
 	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
+	bytes_read = FinishGuestRead(file, buf, static_cast<uint64_t>(offset), bytes_read,
+	                             std::min<uint64_t>(nbytes, remaining));
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes_read);
 	file->f.Seek(pos);
 
